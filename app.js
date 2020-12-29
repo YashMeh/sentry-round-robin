@@ -1,5 +1,7 @@
-const { projectID, orgSlug, integrationProjectID, sentryAPISecret } = require("./constants").constants;
-const { getProjectUsers, assignIssue } = require("./apiRequests");
+const {
+  integrationProjectID,
+  sentryAPISecret,
+} = require("./constants").constants;
 const verifySignature = require("./verify");
 const sentry = require("./sentry");
 
@@ -7,6 +9,9 @@ const http = require("http");
 const express = require("express");
 const app = express();
 const bodyParser = require("body-parser");
+const { WebClient } = require("@slack/web-api");
+const token = process.env.SLACK_TOKEN;
+const bot = new WebClient(token);
 
 app.use(bodyParser.json());
 
@@ -16,123 +21,51 @@ app.allUsers = [];
 // Array of usernames queued up to be assigned to upcoming new issues
 app.queuedUsers = [];
 
-const errorWrapper = fn => {
+const errorWrapper = (fn) => {
   return async (req, res, next) => {
     try {
       await fn(req, res, next);
-    } catch(err) {
-      next(err)
+    } catch (err) {
+      next(err);
     }
-  }
-}
-
+  };
+};
 // When receiving a POST request from Sentry:
-app.post("/", errorWrapper(async function post(request, response) {
-  if (!verifySignature(request, sentryAPISecret)) {
-    return response.status(401).send('bad signature');
-  }
-
-  const resource = request.get("sentry-hook-resource");
-  const {action} = request.body;
-
-  if (sentry) {
-    sentry.addBreadcrumb({
-      message: `Request received. resource: ${resource}, action: ${action}`,
-      level: sentry.Severity.Info
-    });
-  }
-
-  // If a new issue was just created
-  if (resource === "issue" && action === "created") {
-
-    const {id:newIssueProjectID} = request.body.data.issue.project;
-    // Only continue if this issue is for the project specified in .env
-    if (newIssueProjectID === projectID) {
-      
-      // Init or reset queue if empty
-      if (app.queuedUsers.length === 0) {
-        app.queuedUsers = [...app.allUsers];
-      }
-  
-      // Assign issue to the next user in the queue and remove user from queue
-      const {id:issueID} = request.body.data.issue;
-      await assignNextUser(issueID);
-
-      if (sentry) {
-        sentry.addBreadcrumb({
-          message: `New issue created. issueID: ${issueID}`,
-          level: sentry.Severity.Info
-        });
-      }
+app.post(
+  "/",
+  errorWrapper(async function post(request, response) {
+    if (!verifySignature(request, sentryAPISecret)) {
+      return response.status(401).send("bad signature");
     }
-  }
 
-  response.status(200).send("ok");
-}));
+    const wantObject = {
+      projectName: `${request.body.data.issue.project.slug}`,
+      errorTitle: `${request.body.data.issue.title}`,
+      fileName: `${request.body.data.issue.metadata.filename}`,
+      timeStamp: `${request.body.data.issue.lastSeen}`,
+    };
+    bot.chat.postMessage({
+      text: "Something Went Wrong  :fire_engine:",
+      attachments: [
+        {
+          text: `Project- ${wantObject.projectName},\n Error- ${wantObject.errorTitle}, \n File- ${wantObject.fileName}, \n Time- ${wantObject.timeStamp} \n`,
+        },
+      ],
+      channel: process.env.SLACK_CHANNEL,
+    });
+
+    response.status(200).send("ok");
+  })
+);
 
 // Get list of users for project, save to queue
 async function init() {
-
   if (sentry) {
     sentry.addBreadcrumb({
       message: `Server initialized`,
-      level: sentry.Severity.Info
+      level: sentry.Severity.Info,
     });
   }
-
-  let updatedUsers = await getProjectUsers(projectID, orgSlug);
-
-  if (sentry) {
-      sentry.addBreadcrumb({
-        message: `updatedUsers: ${updatedUsers}`,
-       level: sentry.Severity.Info
-     });
-    }
-
-  // If newly-retrieved list is still empty, give up!
-  if (updatedUsers.length === 0) {
-    throw new Error(`Unable to retrieve any users with access to project ${projectID}.`);
-  }
-
-  // Init queue and master list
-  app.allUsers = [...updatedUsers];
-  app.queuedUsers = [...updatedUsers];
-}
-
-async function assignNextUser(issueID) {
-  while (app.allUsers && app.allUsers.length > 0) {
-    // Reset queue if empty by copying from master list
-    if (app.queuedUsers && app.queuedUsers.length === 0) {
-      repopulateUserQueue();
-    }
-    const dequeuedUser = app.queuedUsers.shift();
-    try { 
-      let result = await assignIssue(issueID, dequeuedUser);
-      // Stop loop once successfully assigned
-      return;
-    } catch (error) {
-      if (error.statusCode === 400) {
-        // If the user is invalid, pull them out of the master list and continue loop
-        removeUserFromList(dequeuedUser);
-      } else {
-        // For any other error code, peace out
-        console.error("Can't assign issue. ");
-        throw error;
-      }
-    }
-  }
-
-  throw new Error("Can't assign issue; no valid users remaining in master list. At this point, just go restart the server!");
-
-}
-
-function removeUserFromList(targetUser) {
-  app.allUsers = app.allUsers.filter(user => user !== targetUser);
-}
-
-function repopulateUserQueue() {
-  // Reset queuedUsers with list of available users
-  app.queuedUsers = [...app.allUsers];
 }
 
 app.use(function onError(err, req, res, next) {
